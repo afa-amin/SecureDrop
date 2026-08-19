@@ -5,19 +5,33 @@ use crate::crypto::policy::{parse_policy, AccessNode};
 use crate::error::{Result, SecureDropError};
 use bls12_381::{G1Affine, G1Projective, G2Affine, G2Projective, Gt, Scalar};
 use ff::Field;
-use group::Group;
+use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use zeroize::Zeroize;
 
-const HKDF_INFO: &[u8] = b"SecureDrop-CPABE-DEK-v1";
+/// Domain separation for Gt → IKM transcript
+const GT_TRANSCRIPT_DST: &[u8] = b"SecureDrop-Gt-Transcript-v3";
+/// HKDF salt (extract stage)
+const HKDF_SALT: &[u8] = b"SecureDrop-Wrap-Salt-v3";
+/// HKDF info / context (expand stage)
+const HKDF_INFO: &[u8] = b"SecureDrop-CPABE-WrapKey-v3";
 
 pub fn default_universe() -> Vec<String> {
     let mut attrs = Vec::new();
     for i in 1..=10 {
         attrs.push(format!("clearance>={}", i));
     }
-    for d in &["intelligence", "operations", "engineering", "finance", "hr", "legal", "executive"] {
+    for d in &[
+        "intelligence",
+        "operations",
+        "engineering",
+        "finance",
+        "hr",
+        "legal",
+        "executive",
+    ] {
         attrs.push(format!("department={}", d));
     }
     for r in &["analyst", "operator", "admin", "auditor", "contractor"] {
@@ -135,7 +149,10 @@ fn share_secret(
             out.insert(attr_id, (c_y, c_y_prime));
             Ok(())
         }
-        AccessNode::Threshold { threshold, children } => {
+        AccessNode::Threshold {
+            threshold,
+            children,
+        } => {
             let t = *threshold;
             let mut coeffs = vec![secret];
             for _ in 1..t {
@@ -156,7 +173,52 @@ fn share_secret(
     }
 }
 
-/// Encrypt: produce ABE ciphertext + the DEK derived from e(g,g)^{alpha s}.
+/// Build IKM bytes from a Gt element.
+///
+/// bls12_381 0.8 does not expose a stable public encoding for Gt.
+/// We build a domain-separated transcript and hash it into fixed-length IKM.
+/// This is for KDF use only (not for wire serialization of Gt).
+fn gt_to_ikm(gt: &Gt) -> [u8; 64] {
+    let repr = format!("{:?}", gt);
+    let mut hasher = Sha256::new();
+    hasher.update(GT_TRANSCRIPT_DST);
+    hasher.update((repr.len() as u64).to_le_bytes());
+    hasher.update(repr.as_bytes());
+    let block1 = hasher.finalize();
+
+    let mut hasher2 = Sha256::new();
+    hasher2.update(GT_TRANSCRIPT_DST);
+    hasher2.update(b"block2");
+    hasher2.update(&block1);
+    hasher2.update(repr.as_bytes());
+    let block2 = hasher2.finalize();
+
+    let mut ikm = [0u8; 64];
+    ikm[..32].copy_from_slice(&block1);
+    ikm[32..].copy_from_slice(&block2);
+    ikm
+}
+
+/// HKDF-Extract + HKDF-Expand → 32-byte wrapping key from Gt shared secret.
+fn wrapping_key_from_gt(gt: &Gt) -> Result<[u8; 32]> {
+    let ikm = gt_to_ikm(gt);
+    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), &ikm);
+    let mut okm = [0u8; 32];
+    hk.expand(HKDF_INFO, &mut okm)
+        .map_err(|e| SecureDropError::Crypto(format!("HKDF expand failed: {}", e)))?;
+    Ok(okm)
+}
+
+fn sha256_32(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let out = hasher.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// Encrypt: random DEK, wrap it with HKDF(e(g,g)^{alpha s}), return ABE CT + DEK.
 pub fn encrypt_keying_material(
     pk: &PublicKey,
     policy_str: &str,
@@ -165,10 +227,24 @@ pub fn encrypt_keying_material(
     let tree = parse_policy(policy_str)?;
     let s = Scalar::random(&mut *rng);
 
-    let e_gg_alpha_s = pk.e_gg_alpha * s;
-    let dek = derive_dek_from_gt(&e_gg_alpha_s)?;
+    // Random DEK (never derived directly from Gt)
+    let mut dek = [0u8; 32];
+    rng.fill_bytes(&mut dek);
+    let dek_hash = sha256_32(&dek);
 
-    let c_prime = pk.h * s;  // must be h^s = g^{β s}, not g^s
+    // R = e(g,g)^{alpha s}
+    let e_gg_alpha_s = pk.e_gg_alpha * s;
+    let mut wrap_key = wrapping_key_from_gt(&e_gg_alpha_s)?;
+
+    // wrapped_dek = DEK XOR wrap_key
+    let mut wrapped_dek = [0u8; 32];
+    for i in 0..32 {
+        wrapped_dek[i] = dek[i] ^ wrap_key[i];
+    }
+    wrap_key.zeroize();
+
+    // C' = h^s = g^{beta s}  (BSW07)
+    let c_prime = pk.h * s;
     let mut leaf_components = HashMap::new();
     share_secret(&tree, s, pk, &mut leaf_components, rng)?;
 
@@ -176,6 +252,8 @@ pub fn encrypt_keying_material(
         policy: policy_str.to_string(),
         c_prime,
         leaf_components,
+        wrapped_dek,
+        dek_hash,
     };
     Ok((ct, dek))
 }
@@ -197,8 +275,24 @@ pub fn decrypt_keying_material(
     let d_aff = G2Affine::from(sk.d);
     let e_c_d = bls12_381::pairing(&c_prime_aff, &d_aff);
 
+    // e(g,g)^{alpha s} = e(C', D) / e(g,g)^{r s}
     let e_gg_alpha_s = e_c_d - result;
-    derive_dek_from_gt(&e_gg_alpha_s)
+    let mut wrap_key = wrapping_key_from_gt(&e_gg_alpha_s)?;
+
+    let mut dek = [0u8; 32];
+    for i in 0..32 {
+        dek[i] = ct.wrapped_dek[i] ^ wrap_key[i];
+    }
+    wrap_key.zeroize();
+
+    // Integrity check — wrong recovery ⇒ hash mismatch
+    let got_hash = sha256_32(&dek);
+    if got_hash != ct.dek_hash {
+        dek.zeroize();
+        return Err(SecureDropError::DecryptionFailed);
+    }
+
+    Ok(dek)
 }
 
 fn decrypt_node(
@@ -213,14 +307,24 @@ fn decrypt_node(
             if !user_attrs.contains(&attr_id) {
                 return Err(SecureDropError::AccessDenied);
             }
-            let (d_i, d_i_prime) = sk.components.get(&attr_id).ok_or(SecureDropError::AccessDenied)?;
-            let (c_y, c_y_prime) = ct.leaf_components.get(&attr_id).ok_or(SecureDropError::DecryptionFailed)?;
+            let (d_i, d_i_prime) = sk
+                .components
+                .get(&attr_id)
+                .ok_or(SecureDropError::AccessDenied)?;
+            let (c_y, c_y_prime) = ct
+                .leaf_components
+                .get(&attr_id)
+                .ok_or(SecureDropError::DecryptionFailed)?;
 
             let e1 = bls12_381::pairing(&G1Affine::from(*c_y), &G2Affine::from(*d_i));
-            let e2 = bls12_381::pairing(&G1Affine::from(*c_y_prime), &G2Affine::from(*d_i_prime));
+            let e2 =
+                bls12_381::pairing(&G1Affine::from(*c_y_prime), &G2Affine::from(*d_i_prime));
             Ok(e1 - e2)
         }
-        AccessNode::Threshold { threshold, children } => {
+        AccessNode::Threshold {
+            threshold,
+            children,
+        } => {
             let mut satisfied = Vec::new();
             for (i, child) in children.iter().enumerate() {
                 if let Ok(val) = decrypt_node(child, sk, ct, user_attrs) {
@@ -250,25 +354,6 @@ fn decrypt_node(
             Ok(result)
         }
     }
-}
-
-/// Derive DEK from Gt.
-/// Note: bls12_381 0.8 does not expose a stable public byte encoding for Gt,
-/// so we use a deterministic Debug-based KDF for this engineering prototype.
-/// Production code should use a crate that provides Gt serialization or a different KEM.
-fn derive_dek_from_gt(gt: &Gt) -> Result<[u8; 32]> {
-    let s = format!("{:?}", gt);
-    let mut hasher = Sha256::new();
-    hasher.update(b"SecureDrop-Gt-KDF-");
-    hasher.update(s.as_bytes());
-    let hash = hasher.finalize();
-    let mut okm = [0u8; 32];
-    okm.copy_from_slice(&hash);
-    let hk = hkdf::Hkdf::<Sha256>::new(None, &okm);
-    let mut final_dek = [0u8; 32];
-    hk.expand(HKDF_INFO, &mut final_dek)
-        .map_err(|e| SecureDropError::Crypto(format!("HKDF failed: {}", e)))?;
-    Ok(final_dek)
 }
 
 #[cfg(test)]

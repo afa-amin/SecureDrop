@@ -13,7 +13,6 @@ use zeroize::Zeroize;
 
 const NONCE_LEN: usize = 12;
 
-/// Serializable leaf component.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StoredLeaf {
     pub attr: String,
@@ -21,15 +20,15 @@ pub struct StoredLeaf {
     pub c_y_prime: Vec<u8>,
 }
 
-/// Serializable ABE ciphertext.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StoredAbe {
     pub policy: String,
     pub c_prime: Vec<u8>,
     pub leaves: Vec<StoredLeaf>,
+    pub wrapped_dek: [u8; 32],
+    pub dek_hash: [u8; 32],
 }
 
-/// Complete package that is written to a .sdrop file.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SecurePackage {
     pub version: u32,
@@ -74,7 +73,7 @@ impl SecurePackage {
             })
             .collect();
         Self {
-            version: 1,
+            version: 2, // bumped: wrapped_dek + dek_hash
             created_at: chrono::Utc::now().timestamp(),
             original_filename,
             policy,
@@ -82,6 +81,8 @@ impl SecurePackage {
                 policy: abe.policy,
                 c_prime: g1_to_bytes(&abe.c_prime),
                 leaves,
+                wrapped_dek: abe.wrapped_dek,
+                dek_hash: abe.dek_hash,
             },
             nonce,
             ciphertext,
@@ -100,6 +101,8 @@ impl SecurePackage {
             policy: self.abe_ct.policy.clone(),
             c_prime: g1_from_bytes(&self.abe_ct.c_prime)?,
             leaf_components,
+            wrapped_dek: self.abe_ct.wrapped_dek,
+            dek_hash: self.abe_ct.dek_hash,
         })
     }
 }

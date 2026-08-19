@@ -62,7 +62,7 @@ The cryptographic core is an engineering implementation of a known CP-ABE constr
 ### Build
 
 ```bash
-git clone https://github.com/YOUR_USER/securedrop.git
+git clone https://github.com/afa-amin/SecureDrop.git
 cd securedrop
 cargo build --release
 ```

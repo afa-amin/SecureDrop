@@ -12,6 +12,7 @@ pub struct MasterSecretKey {
 
 impl Drop for MasterSecretKey {
     fn drop(&mut self) {
+        // Best-effort overwrite of secret scalars
         self.alpha = Scalar::zero();
         self.beta = Scalar::zero();
     }
@@ -39,17 +40,23 @@ pub struct UserSecretKey {
 
 impl Drop for UserSecretKey {
     fn drop(&mut self) {
+        // Clear sensitive maps and identity; group elements are overwritten by drop of map
         self.components.clear();
         self.attributes.clear();
         self.user_id.clear();
+        self.d = G2Projective::identity();
     }
 }
 
 /// Ciphertext components for the ABE keying material.
-/// The recoverable value is e(g,g)^{alpha s}; no message is embedded in Gt.
+/// Recoverable value is e(g,g)^{alpha s}. The actual DEK is random and wrapped.
 #[derive(Clone)]
 pub struct AbeCiphertext {
     pub policy: String,
-    pub c_prime: G1Projective, // g^s
+    pub c_prime: G1Projective, // h^s = g^{beta s}
     pub leaf_components: HashMap<String, (G1Projective, G1Projective)>,
+    /// DEK XOR mask(kdf(e(g,g)^{alpha s})) — 32 bytes
+    pub wrapped_dek: [u8; 32],
+    /// SHA-256(DEK) for integrity check after unwrap
+    pub dek_hash: [u8; 32],
 }

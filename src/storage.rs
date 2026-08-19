@@ -3,10 +3,11 @@
 use crate::crypto::{MasterSecretKey, PublicKey, SecurePackage, UserSecretKey};
 use crate::error::{Result, SecureDropError};
 use bls12_381::{G1Affine, G1Projective, G2Affine, G2Projective, Scalar};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_DIR_NAME: &str = ".securedrop";
@@ -58,6 +59,54 @@ pub fn ensure_data_dir(dir: &Path) -> Result<()> {
         let perms = fs::Permissions::from_mode(0o700);
         let _ = fs::set_permissions(dir, perms);
     }
+    Ok(())
+}
+
+/// Securely overwrite a file before deleting it (best-effort on SSD).
+fn secure_delete(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let len = fs::metadata(path)?.len();
+    if len > 0 {
+        let mut file = OpenOptions::new().write(true).open(path)?;
+        let mut rng = rand::thread_rng();
+
+        // Pass 1–2: zeros
+        let zero_chunk = vec![0u8; 65536];
+        for _ in 0..2 {
+            file.seek(SeekFrom::Start(0))?;
+            let mut remaining = len;
+            while remaining > 0 {
+                let n = remaining.min(zero_chunk.len() as u64) as usize;
+                file.write_all(&zero_chunk[..n])?;
+                remaining -= n as u64;
+            }
+            file.sync_all()?;
+        }
+
+        // Pass 3: random
+        file.seek(SeekFrom::Start(0))?;
+        let mut remaining = len;
+        while remaining > 0 {
+            let n = remaining.min(65536) as usize;
+            let mut buf = vec![0u8; n];
+            rng.fill_bytes(&mut buf);
+            file.write_all(&buf)?;
+            remaining -= n as u64;
+        }
+        file.sync_all()?;
+        // Final zeros
+        file.seek(SeekFrom::Start(0))?;
+        let mut remaining = len;
+        while remaining > 0 {
+            let n = remaining.min(zero_chunk.len() as u64) as usize;
+            file.write_all(&zero_chunk[..n])?;
+            remaining -= n as u64;
+        }
+        file.sync_all()?;
+    }
+    fs::remove_file(path)?;
     Ok(())
 }
 
@@ -246,11 +295,11 @@ pub fn list_users(dir: &Path) -> Result<Vec<String>> {
 
 pub fn delete_user(dir: &Path, user: &str) -> Result<()> {
     let path = dir.join(USERS_DIR).join(format!("{}.key", user));
-    if path.exists() {
-        fs::remove_file(path)?;
-    } else {
+    if !path.exists() {
         return Err(SecureDropError::UserNotFound(user.to_string()));
     }
+    // Secure overwrite then remove
+    secure_delete(&path)?;
     Ok(())
 }
 
