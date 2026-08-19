@@ -934,37 +934,11 @@ cargo build
 
 Suppose an organization has three employees with different clearance levels, departments, and roles:
 
-User
-
-Clearance
-
-Department
-
-Role
-
-**Alice**
-
-`4`
-
-`intelligence`
-
-`analyst`
-
-**Bob**
-
-`2`
-
-`operations`
-
-`operator`
-
-**Charlie**
-
-`5`
-
-`engineering`
-
-`engineer`
+| User     | Clearance | Department     | Role       |
+|----------|-----------|----------------|------------|
+| **Alice**| `4`       | `intelligence` | `analyst`  |
+| **Bob**  | `2`       | `operations`   | `operator` |
+| **Charlie**| `5`     | `engineering`  | `engineer` |
 
 An administrator can issue their keys:
 
