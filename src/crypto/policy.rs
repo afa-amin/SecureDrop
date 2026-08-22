@@ -13,7 +13,7 @@
 
 use crate::error::{Result, SecureDropError};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// Leaf attribute in the access tree.
@@ -47,6 +47,22 @@ impl Attribute {
     pub fn id(&self) -> String {
         match &self.value {
             Some(v) => format!("{}={}", self.name, v),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Which authority governs this attribute, in multi-authority mode.
+    /// `clearance>=4` -> "clearance"; `department=intelligence` -> "department".
+    /// (Today this is just `self.name`, but it is kept as a distinct concept
+    /// since a deployment may later want several attribute names under one
+    /// authority, e.g. both `department=` and `division=` issued by the same
+    /// HR authority.)
+    pub fn authority(&self) -> String {
+        // `clearance>=N` attributes store the whole comparison in `name`
+        // (see `clearance_ge`), so strip the operator back off; all other
+        // attributes store a bare name ("department", "role", ...) already.
+        match self.name.split_once(">=") {
+            Some((base, _)) => base.to_string(),
             None => self.name.clone(),
         }
     }
@@ -327,6 +343,69 @@ fn parse_attribute(s: &str) -> Result<Attribute> {
         }
     } else {
         Ok(Attribute::new(lower, None))
+    }
+}
+
+/// Partition an access tree into one subtree per authority, for multi-authority
+/// encryption. This is only possible if every OR / k-of-n threshold node's
+/// leaves all belong to a single authority — under Chase's (TCC 2007)
+/// multi-authority construction, distinct authorities can only be combined
+/// with AND, never OR or general threshold, because each authority's
+/// contribution is reconstructed independently and then summed centrally.
+///
+/// Returns a map from authority id -> the access-tree fragment (already an
+/// AND of everything required from that authority).
+pub fn partition_by_authority(
+    node: &AccessNode,
+) -> Result<HashMap<String, AccessNode>> {
+    match node {
+        AccessNode::Leaf(attr) => {
+            let mut m = HashMap::new();
+            m.insert(attr.authority(), AccessNode::Leaf(attr.clone()));
+            Ok(m)
+        }
+        AccessNode::Threshold {
+            threshold,
+            children,
+        } => {
+            if *threshold == children.len() {
+                // AND node: fine to span multiple authorities. Recurse and
+                // merge; if two children touch the same authority, AND their
+                // fragments together.
+                let mut acc: HashMap<String, AccessNode> = HashMap::new();
+                for child in children {
+                    let child_map = partition_by_authority(child)?;
+                    for (auth, frag) in child_map {
+                        acc.entry(auth)
+                            .and_modify(|existing| {
+                                *existing =
+                                    AccessNode::and(vec![existing.clone(), frag.clone()]);
+                            })
+                            .or_insert(frag);
+                    }
+                }
+                Ok(acc)
+            } else {
+                // OR or general k-of-n: every leaf underneath must belong to
+                // the same authority, since we cannot let two authorities
+                // stand in for one another (that would let an authority
+                // decrypt on behalf of another, or need cross-authority
+                // interaction to prevent collusion).
+                let leaves = node.collect_attributes();
+                let authorities: HashSet<String> =
+                    leaves.iter().map(|a| a.authority()).collect();
+                if authorities.len() > 1 {
+                    return Err(SecureDropError::MixedAuthorityPolicy(node.to_string()));
+                }
+                let auth = authorities
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| SecureDropError::InvalidPolicy("empty node".into()))?;
+                let mut m = HashMap::new();
+                m.insert(auth, node.clone());
+                Ok(m)
+            }
+        }
     }
 }
 

@@ -75,7 +75,7 @@ pub fn setup(universe: &[String], rng: &mut impl RngCore) -> (PublicKey, MasterS
     (pk, msk)
 }
 
-fn hash_to_g2(attr: &str) -> G2Projective {
+pub(crate) fn hash_to_g2(attr: &str) -> G2Projective {
     let mut hasher = Sha256::new();
     hasher.update(b"SecureDrop-H-attr-");
     hasher.update(attr.as_bytes());
@@ -86,7 +86,7 @@ fn hash_to_g2(attr: &str) -> G2Projective {
     G2Projective::generator() * s
 }
 
-fn hash_to_g1(attr: &str) -> G1Projective {
+pub(crate) fn hash_to_g1(attr: &str) -> G1Projective {
     let mut hasher = Sha256::new();
     hasher.update(b"SecureDrop-H-attr-");
     hasher.update(attr.as_bytes());
@@ -200,7 +200,7 @@ fn gt_to_ikm(gt: &Gt) -> [u8; 64] {
 }
 
 /// HKDF-Extract + HKDF-Expand → 32-byte wrapping key from Gt shared secret.
-fn wrapping_key_from_gt(gt: &Gt) -> Result<[u8; 32]> {
+pub(crate) fn wrapping_key_from_gt(gt: &Gt) -> Result<[u8; 32]> {
     let ikm = gt_to_ikm(gt);
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), &ikm);
     let mut okm = [0u8; 32];
@@ -209,7 +209,7 @@ fn wrapping_key_from_gt(gt: &Gt) -> Result<[u8; 32]> {
     Ok(okm)
 }
 
-fn sha256_32(data: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256_32(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
     let out = hasher.finalize();

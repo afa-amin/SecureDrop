@@ -40,6 +40,16 @@ pub enum SecureDropError {
     #[error("Attribute `{0}` is not in the allowed universe")]
     UnknownAttribute(String),
 
+    #[error("Authority `{0}` is not registered with the central authority")]
+    UnknownAuthority(String),
+
+    #[error(
+        "Policy mixes attributes from multiple authorities under OR/threshold at: {0}. \
+         In multi-authority mode, OR/threshold combinators may only combine attributes \
+         from a single authority; authorities themselves are always combined with AND."
+    )]
+    MixedAuthorityPolicy(String),
+
     #[error("{0}")]
     Other(String),
 }

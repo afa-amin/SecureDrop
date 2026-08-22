@@ -2,6 +2,7 @@
 
 pub mod hybrid;
 pub mod keys;
+pub mod mabe;
 pub mod policy;
 pub mod scheme;
 
